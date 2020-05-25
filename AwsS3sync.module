@@ -1,0 +1,525 @@
+<?php namespace ProcessWire;
+
+/**
+ * AWS S3 Sync Module
+ * Developed to sync assets to AWS S3 and delete them when removed from the system
+ * It will also replace media URL's to a CDN.
+ * 
+ * To-do: Add cropping support (Pageimage / size?)
+ * To-do: Add overwrite support (maybe piggy back off of addFile?)
+ * To-do: Add image rename support (InputfieldFile / processInputFile?)
+ * 
+ * Possible to have just images on S3?  (renderItem from InputfieldImage) // probably not InputfieldImage since it has to be all asset types
+ * 
+ */
+
+/**
+ * Load AWS Framework
+ */
+require 'aws/aws-autoloader.php';
+use Aws\S3\S3Client;
+
+class AwsS3sync extends WireData implements Module, ConfigurableModule {
+
+	/**
+	 * Module Info
+	 */
+	public static function getModuleInfo() {
+
+		return array(
+			'title' => 'AWS S3 Sync',
+			'version' => "0.1.0",
+			'summary' => 'Sync assets to AWS S3 and deletes them when removed from the system.  It will also allow you to specify a CDN to serve the assets from.',
+			'href' => 'https://scorpion.io',
+			'singular' => true,
+			'autoload' => true,
+			'icon' => 'refresh', 
+		);
+	}
+
+	/**********************************************************************************************
+	 * Initialize Module
+	 **********************************************************************************************/
+	public function init() {
+
+		$this->client = S3Client::factory(array(
+			'credentials' => array(
+				'key' => $this->s3Key,
+				'secret'  => $this->s3Secret,
+			),
+			'version' => 'latest',
+			'region'  => $this->s3Region
+		));
+
+		// Hash file names in the system on upload
+		//$this->addHookBefore('InputfieldFile::fileAdded', $this, 'renameFile');
+
+		// Upload assets to AWS S3
+		$this->addHook('InputfieldFile::fileAdded', $this, 'addFile');
+
+		// Overwrite assets if needed
+		$this->addHook('InputfieldFile::processInputFile', $this, 'overwrite');
+
+		// Check is this is a new resize request or does the image already exist?
+		//$this->addHookBefore('Pageimage::size', $this, 'resizeCheck');
+
+		// Upload image varients to AWS S3
+		$this->addHook('Pageimage::size', $this, 'addSize');
+
+		// Delete assets on AWS S3
+		$this->addHook('Pagefiles::delete', $this, 'deleteFile');
+
+		// Delete temp upload images
+		$this->addHookBefore('InputfieldImage::renderList', $this, 'deleteTempFiles');
+
+		// Redirect Media URL
+		$this->addHookAfter('PagefilesManager::url', $this, 'redirectURL');
+	}
+
+	/**********************************************************************************************
+	 * Rename Uploaded Files
+	 **********************************************************************************************/
+	public function renameFile($event){
+		// I recommend you use this - https://github.com/adrianbj/CustomUploadNames
+	}
+
+	/**********************************************************************************************
+	 * Upload Files
+	 **********************************************************************************************/
+	public function addFile($event){
+		// Check if S3 uploading is enabled
+		if ($this->s3Enable == true) {
+			$file = $event->arguments(0); 
+			//bd($file);
+			$filename = $file->name;
+			$filename_original = $file->url;
+			$pathToFile = $file->filename();
+
+			$s3path = $this->s3Subfolder . $file->page . "/" . $filename;
+
+			$s3args = array(
+				'Bucket' 	 => $this->s3Bucket,
+				'Key'        => $s3path,			// filename on S3
+				'ACL'	     => $this->s3Acl,
+				'SourceFile' => $pathToFile,	    // path to uploaded file via PW
+				'Tagging'    => "original=$file->page-$filename",// . $filename_original
+				'Metadata'   => array(
+					'original_url' => $filename_original,
+					'info' => 'Uploaded via the AwsS3sync PW Module'
+				)
+			);
+
+			try {
+				$result = $this->client->putObject($s3args);
+			} catch (Exception $e){
+				throw new WireException("Error: File not Added to S3: {$e->getMessage()}");  
+			}
+		}
+	}
+
+	public function resizeCheck($event){
+		//bd($event);
+	}
+
+	/**********************************************************************************************
+	 * Overwrite images if needed
+	 **********************************************************************************************/
+	public function overwrite($event){
+		//bd($event);
+	}
+
+	/**********************************************************************************************
+	 * Upload image varients
+	 **********************************************************************************************/
+	public function addSize($event){
+		// Check if S3 uploading is enabled
+		if ($this->s3Enable == true) {
+			// Since this is an input field, being on admin messes up how page id is obtained.
+			if($event->page->template == 'admin') {
+				// Get page ID
+				$this->page = $this->pages->get($this->input->get->id);
+				$page = $this->page->id;
+
+				// Reno theme profile pic does some weird things, check if the template is user,
+				// then redirect to user ID.
+				if ($event->object->page->template->name == "user") {
+					$page = $this->wire('user')->id;
+				}
+			} else {
+				// Not admin page, set via wire page
+				$page = wire('page');
+			}
+
+			// File we are working with
+			$filename = $event->return->data('basename');
+			// Bucket to check if it exists
+			$bucket = $this->s3Bucket;
+			// Make call to S3
+			$response = $this->client->doesObjectExist($bucket, wire('page') . "/" . $filename);
+
+			// If S3 could not find it, start the process of upload
+			if (!$response) {
+				// New Filename
+				$filename = $event->return->data('basename');
+				// Original Filename (for S3 metadata)
+				$filename_original = $event->object->data('basename');
+				// The file that will be uploaded
+				$pathToFile = wire('config')->paths->files . $page . "/" . $filename;
+				// Where to put the image in the bucket
+				$s3path = $this->s3Subfolder . $page . "/" . $filename;
+
+				$s3args = array(
+					'Bucket' 	 => $this->s3Bucket,
+					'Key'        => $s3path,			// filename on S3
+					'ACL'	     => $this->s3Acl,
+					'SourceFile' => $pathToFile,	    // path to uploaded file via PW
+					'Tagging'    => "original=$page-$filename_original",// . $filename_original
+					'Metadata'   => array(
+						'original' => $filename_original,
+						'info' => 'Uploaded via the AwsS3sync PW Module'
+					)
+				);
+
+				try {
+					$result = $this->client->putObject($s3args);
+				} catch (Exception $e){
+					throw new WireException("Error: File not Added to S3: {$e->getMessage()}");  
+				}
+			}
+		}
+	}
+
+	/**********************************************************************************************
+	 * Delete Files
+	 **********************************************************************************************/
+	public function deleteFile($event){
+		bd($event);
+		// Check if S3 uploading is enabled
+		if ($this->s3Enable == true) {
+			$file = $event->arguments(0);
+			$page = $file->page->id;
+			$filename = $file->name;
+			$s3path = $this->s3Subfolder . $page;
+			$bucket = $this->s3Bucket;
+
+			try {
+				// Get objects from bucket using page id
+				$objects = $this->client->getIterator('ListObjects', array(
+					"Bucket" => $bucket,
+					"Prefix" => "$s3path/"
+				));
+
+				// Itirate through the found images
+				foreach ($objects as $object) {
+
+					// Get the Tag associated with the image
+					$result = $this->client->getObjectTagging(array(
+						'Bucket' => $bucket,
+						'Key'    => $object['Key']
+					));
+
+					//$this->message("S3 Tag: " . $result['TagSet'][0]['Value'] . "$x"); // Cool messaging thing
+
+					// Does the tag match the image we are trying to delete?
+					if ($result['TagSet'][0]['Value'] == $page . '-' . $filename) {
+						// Delete object with S3 call.
+						$this->client->deleteObject(array(
+							'Bucket' => $bucket,
+							'Key' => $object['Key']
+						));
+					}
+				}
+			}
+			catch (Exception $e){
+				throw new WireException("Error from S3: {$e->getMessage()}");  
+			}
+		}
+	}
+
+	/**********************************************************************************************
+	 * Remove temp files
+	 **********************************************************************************************/
+	public function deleteTempFiles($event){
+		// Check if S3 uploading is enabled
+		if ($this->s3Enable == true) {
+			// Get image information
+			$image = $event->arguments(0);
+			// Get the image name a created time from the array
+			$imageInfo = $image->created();
+			// Set the creation time
+			$created = reset($imageInfo);
+			// Set the filename
+			$filename = key($imageInfo);
+
+			// Check if the file is temp or not
+			if ($created && $created < 14400) {
+				// Since this is an input field, being on admin messes up how page id is obtained.
+				if($event->page->template == 'admin') {
+					// Get page ID
+					$this->page = $this->pages->get($this->input->get->id);
+					$page = $this->page->id;
+
+					// Reno theme profile pic does some weird things, check if the template is user,
+					// then redirect to user ID.
+					if ($event->object->page->template->name == "user") {
+						$page = $this->wire('user')->id;
+					}
+				} else {
+					// Not admin page, set via wire page
+					$page = wire('page');
+				}
+				
+				$s3path = $this->s3Subfolder . $page;
+				$bucket = $this->s3Bucket;
+
+				try {
+					// Get objects from bucket using page id
+					$objects = $this->client->getIterator('ListObjects', array(
+						"Bucket" => $bucket,
+						"Prefix" => "$s3path/"
+					));
+
+					// Itirate through the found images
+					foreach ($objects as $object) {
+
+						// Get the Tag associated with the image
+						$result = $this->client->getObjectTagging(array(
+							'Bucket' => $bucket,
+							'Key'    => $object['Key']
+						));
+
+						// Does the tag match the image we are trying to delete?
+						if ($result['TagSet'][0]['Value'] == $page . '-' . $filename) {
+							// Delete object with S3 call.
+							$this->client->deleteObject(array(
+								'Bucket' => $bucket,
+								'Key' => $object['Key']
+							));
+						}
+					}
+				}
+				catch (Exception $e){
+					throw new WireException("Error from S3: {$e->getMessage()}");  
+				}
+
+			}
+		}
+	}
+
+	/**********************************************************************************************
+	 * Redirect assets URLs to CDN URL
+	 **********************************************************************************************/
+	public function redirectURL($event){
+		// Check if CDN is enabled
+		if ($this->cdnEnable == true) {
+			// Check if we are on the backend/admin
+			if ($event->page->template == 'admin') {
+				// Check if we should use the CDN
+				if ($this->cdnAdmin == false) {
+					// Do not use CDN
+					return;
+				} else {
+					// Use CDN
+					$event->return = $this->cdnURL . $this->s3Subfolder . $event->object->page . "/" . $event->object->name;
+				}
+			} else {
+				// We are on a normal page, use a CDN.
+				$event->return = $this->cdnURL . $this->s3Subfolder . $event->object->page . "/" . $event->object->name;
+			}
+		}
+	}
+
+	/**********************************************************************************************
+	 * Configuration - Set Defaults (for initial values)
+	 **********************************************************************************************/
+	static protected $defaults = array(
+		's3Enable' => true,
+		's3Key' => '',
+		's3Secret' => '',
+		's3Bucket' => '',
+		's3Subfolder' => '',
+		's3Acl' => 'public-read',
+		's3Region' => 'us-east-1',
+		'cdnEnable' => false,
+		'cdnURL' => '',
+		'cdnAdmin' => true
+	);
+
+	/**********************************************************************************************
+	 * Configuration - Populate the defaults
+	 **********************************************************************************************/
+	public function __construct() {
+		// populate defaults, which will get replaced with actual
+		// configured values before the init/ready methods are called
+		$this->setArray(self::$defaults);
+	}
+
+	/**********************************************************************************************
+	 * Configuration - Module Configuration (construct form for data input)
+	 **********************************************************************************************/
+	static public function getModuleConfigInputfields(array $data){
+		// Initiate input field wrapper
+		$form = new InputfieldWrapper();
+
+		// Set the defaults for $data
+		$data = array_merge(self::$defaults, $data);
+
+		// -------------------------------------------------------------------------------------- //
+		// Group like fields together in the admin
+		// -------------------------------------------------------------------------------------- //
+
+		// AWS Fieldset
+		$fs_aws = wire('modules')->get("InputfieldFieldset");
+		$fs_aws->label = 'AWS S3';
+		$fs_aws->description = 'Upload assets to AWS.';
+		$fs_aws->id = 'fs_aws';
+		$form->add($fs_aws);
+
+		// CDN Fieldset
+		$fs_cdn = wire('modules')->get("InputfieldFieldset");
+		$fs_cdn->label = 'CDN';
+		$fs_cdn->description = 'Serve uploaded assets from a CDN.';
+		$fs_cdn->id = 'fs_cdn';
+		$form->add($fs_cdn);
+
+		// -------------------------------------------------------------------------------------- //
+		// Fields to create and render in the admin
+		// -------------------------------------------------------------------------------------- //
+
+		// AWS S3 Enable
+		$f = wire('modules')->get('InputfieldCheckbox');
+		$f->attr('name', 's3Enable');
+		$f->label = 'Enable AWS S3?';
+		//$f->label2 = ' ';
+		$f->notes = 'Please be aware that this will only sync new data.  It will not upload any existing data into AWS. You will need to manually copy data into AWS S3 if this is an existing site.';
+		$f->attr('checked', $data['s3Enable'] );
+		$f->value = $data['s3Enable'];
+		$fs_aws->add($f); // Add to CDN Fieldset
+
+		// AWS S3 Access Key field
+		$f = wire('modules')->get('InputfieldText');
+		$f->attr('name', 's3Key');
+		$f->label = 'AWS Access Key ID:';
+		$f->required = true;
+		$f->columnWidth = 50;
+		$f->attr('value', $data['s3Key']);
+		$fs_aws->add($f); // Add to AWS Fieldset
+
+		// AWS S3 Secret field
+		$f = wire('modules')->get('InputfieldText');
+		$f->type = 'password'; // Masks access key in the module configuration
+		$f->attr('name', 's3Secret');
+		$f->label = 'AWS Secret Access Key:';
+		$f->required = true;
+		$f->columnWidth = 50;
+		$f->attr('value', $data['s3Secret']);
+		$fs_aws->add($f); // Add to AWS Fieldset
+
+		// AWS S3 Bucket Name
+		$f = wire('modules')->get('InputfieldText');
+		$f->attr('name', 's3Bucket');
+		$f->label = 'Bucket Name:';
+		$f->description = 'The S3 Bucket assets will be uploaded to and deleted from.';
+		$f->required = true;
+		$f->attr('value', $data['s3Bucket']);
+		$fs_aws->add($f); // Add to AWS Fieldset
+
+		// AWS S3 Subfolder
+		$f = wire('modules')->get('InputfieldText');
+		$f->attr('name', 's3Subfolder');
+		$f->label = 'Subfolder:';
+		$f->description = 'If you want to use a bucket’s subfolder as a source, specify the path to use here.';
+		$f->notes = "e.g. " . substr(wire('config')->urls->files, 1) . "\n Do not start with a slash, but do end with a slash (/). \n If you do not specify a folder above, all assets will be uploaded into the root bucket and put into a folder with the ID of the page it was created from.";
+		$f->attr('value', $data['s3Subfolder']);
+		$fs_aws->add($f); // Add to AWS Fieldset
+
+		// AWS S3 Permissions
+		$f = wire('modules')->get('InputfieldSelect');
+		$f->attr('name', 's3Acl');
+		$f->label = "ACL File Permissions for S3 Bucket assets:";
+		$f->columnWidth = 50;
+		$f->description = 'This can be used to define the asset permissions uploaded to S3. If you use a CDN to serve your asset files, use the default "public-read". More information [here](http://docs.aws.amazon.com/AmazonS3/latest/dev/acl-overview.html#canned-acl).';
+		$f->addOptions(
+			array(
+			'public-read'				=> 'public-read',				
+			'public-read-write' 		=> 'public-read-write',
+			'authenticated-read'		=> 'authenticated-read',
+			'bucket-owner-read'			=> 'bucket-owner-read',
+			'bucket-owner-full-control'	=> 'bucket-owner-full-control',
+			'private'					=> 'private'
+			)
+		);
+		$f->attr('value', $data['s3Acl']);
+		$fs_aws->add($f); // Add to AWS Fieldset
+
+		// AWS Region
+		$f = wire('modules')->get('InputfieldSelect');
+		$f->attr('name', 's3Region');
+		$f->label = "Region for Uploaded Files:";
+		$f->columnWidth = 50;
+		$f->description = 'A "region" configuration value is required for the "s3" service (e.g., "us-east-1"). A list of available public regions and endpoints can be found [here](http://docs.aws.amazon.com/general/latest/gr/rande.html).';
+		$f->addOptions(
+			array(
+			'us-east-1'				=> 'us-east-1 - US East (N. Virginia)',				
+			'us-east-2' 			=> 'us-east-2 - US East (Ohio)',
+			'us-west-1'				=> 'us-west-1 - US West (N. California)',
+			'us-west-2'				=> 'us-west-2 - US West (Oregon)',
+			'ap-south-1'			=> 'ap-south-1 - Asia Pacific (Mumbai)',
+			'ap-northeast-2'		=> 'ap-northeast-2 - Asia Pacific (Seoul)',
+			'ap-southeast-1' 		=> 'ap-southeast-1 - Asia Pacific (Singapore)',
+			'ap-southeast-2' 		=> 'ap-southeast-2 - Asia Pacific (Sydney)',
+			'ap-northeast-1' 		=> 'ap-northeast-1 - Asia Pacific (Tokyo)',
+			'ca-central-1' 			=> 'ca-central-1 - Canada (Central)',
+			'eu-central-1' 			=> 'eu-central-1 - EU (Frankfurt)',
+			'eu-west-1' 			=> 'eu-west-1 - EU (Ireland)',
+			'eu-west-2' 			=> 'eu-west-2 - EU (London)',
+			'sa-east-1' 			=> 'sa-east-1 - South America (São Paulo)'
+			)
+		);
+		$f->attr('value', $data['s3Region']);
+		$fs_aws->add($f); // Add to AWS Fieldset
+
+		// CDN Enable
+		$f = wire('modules')->get('InputfieldCheckbox');
+		$f->attr('name', 'cdnEnable');
+		$f->label = 'Enable CDN?';
+		//$f->label2 = ' ';
+		$f->notes = 'Make sure to fill out the public URL below or your images and assets will break on the site.';
+		$f->attr('checked', $data['cdnEnable'] );
+		$f->value = $data['cdnEnable'];
+		$fs_cdn->add($f); // Add to CDN Fieldset
+
+		// Public URL
+		$f = wire('modules')->get('InputfieldText');
+		$f->attr('name', 'cdnURL');
+		$f->label = 'Public URL:';
+		$f->description = 'Enter the public address you would like to have assets served from.';
+		$f->notes = "e.g. https://media.domain.com/ \n Ensure you start with HTTP/HTTPS and end the URL with a slash (/)";
+		$f->attr('value', $data['cdnURL']);
+		$fs_cdn->add($f); // Add to CDN Fieldset
+
+		// CDN Enable
+		$f = wire('modules')->get('InputfieldCheckbox');
+		$f->attr('name', 'cdnAdmin');
+		$f->label = 'Serve Assets from CDN in Backend?';
+		//$f->label2 = ' ';
+		$f->notes = 'Enable to serve image and file assets from the CDN in the processwire backend.';
+		$f->attr('checked', $data['cdnAdmin'] );
+		$f->value = $data['cdnAdmin'];
+		$fs_cdn->add($f); // Add to CDN Fieldset
+
+		// -------------------------------------------------------------------------------------- //
+		// Return form to render in admin
+		// -------------------------------------------------------------------------------------- //
+		return $form; 
+	}
+
+	/**********************************************************************************************
+	 * Module Install
+	 **********************************************************************************************/
+    public function ___install() {
+        //$data = array();
+        //$this->wire('modules')->saveModuleConfigData('AwsS3sync', $data);
+    }
+
+}
